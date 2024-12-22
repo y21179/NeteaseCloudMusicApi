@@ -1,5 +1,6 @@
 module.exports = {
   root: true,
+  ignorePatterns: ['public/', 'dist/'],
   parserOptions: {
     parser: 'babel-eslint',
     ecmaVersion: 2018,

@@ -1,13 +1,25 @@
 const fs = require('fs')
 const path = require('path')
 const express = require('express')
-const request = require('./util/request')
+// const request = require('./util/request')
 const packageJSON = require('./package.json')
 const exec = require('child_process').exec
-const cache = require('./util/apicache').middleware
-const { cookieToJson } = require('./util/index')
+const cache = require('./apicache').middleware
+const { cookieToJson } = require('./corejs/util')
 const fileUpload = require('express-fileupload')
 const decode = require('safe-decode-uri-component')
+const apiIndex = require('./corejs/util/api.js')
+
+const request = require('./request.js')
+const { encodeURIComponent, URLSearchParams } = require('./corejs/util')
+const { NeteseCloudMusicApi } = require('./corejs/NeteaseCloudMusic.js')
+const netease_cloud_music_api = new NeteseCloudMusicApi()
+// anonymous_token获取
+const tmpPath = require('os').tmpdir()
+const anonymous_token = fs.readFileSync(
+  path.resolve(tmpPath, './anonymous_token'),
+  'utf-8',
+)
 
 /**
  * The version check result.
@@ -62,28 +74,24 @@ const VERSION_CHECK_RESULT = {
  *
  * @example getModuleDefinitions("./module", {"album_new.js": "/album/create"})
  */
-async function getModulesDefinitions(
-  modulesPath,
-  specificRoute,
-  doRequire = true,
-) {
-  const files = await fs.promises.readdir(modulesPath)
-  const parseRoute = (/** @type {string} */ fileName) =>
-    specificRoute && fileName in specificRoute
-      ? specificRoute[fileName]
-      : `/${fileName.replace(/\.js$/i, '').replace(/_/g, '/')}`
+function getModulesDefinitions(specificRoute) {
+  const files = Object.keys(apiIndex)
+  let parseRoute = (/** @type {string} */ fileName) => {
+    let result =
+      specificRoute && fileName in specificRoute
+        ? specificRoute[fileName]
+        : `/${fileName.replace(/_/g, '/')}`
+    return result
+  }
 
-  const modules = files
-    .reverse()
-    .filter((file) => file.endsWith('.js'))
-    .map((file) => {
-      const identifier = file.split('.').shift()
-      const route = parseRoute(file)
-      const modulePath = path.join(modulesPath, file)
-      const module = doRequire ? require(modulePath) : modulePath
+  // apiIndex写入的时候已经排好序了，这里不要继续翻转
+  const modules = files.map((file) => {
+    const identifier = file
+    const route = parseRoute(file)
+    const module = apiIndex[file]
 
-      return { identifier, route, module }
-    })
+    return { identifier, route, module }
+  })
 
   return modules
 }
@@ -133,6 +141,7 @@ async function checkVersion() {
  */
 async function consturctServer(moduleDefs) {
   const app = express()
+  const { CORS_ALLOW_ORIGIN } = process.env
   app.set('trust proxy', true)
 
   /**
@@ -142,7 +151,8 @@ async function consturctServer(moduleDefs) {
     if (req.path !== '/' && !req.path.includes('.')) {
       res.set({
         'Access-Control-Allow-Credentials': true,
-        'Access-Control-Allow-Origin': req.headers.origin || '*',
+        'Access-Control-Allow-Origin':
+          CORS_ALLOW_ORIGIN || req.headers.origin || '*',
         'Access-Control-Allow-Headers': 'X-Requested-With,Content-Type',
         'Access-Control-Allow-Methods': 'PUT,POST,GET,DELETE,OPTIONS',
         'Content-Type': 'application/json; charset=utf-8',
@@ -189,17 +199,15 @@ async function consturctServer(moduleDefs) {
    * Special Routers
    */
   const special = {
-    'daily_signin.js': '/daily_signin',
-    'fm_trash.js': '/fm_trash',
-    'personal_fm.js': '/personal_fm',
+    daily_signin: '/daily_signin',
+    fm_trash: '/fm_trash',
+    personal_fm: '/personal_fm',
   }
 
   /**
    * Load every modules in this directory
    */
-  const moduleDefinitions =
-    moduleDefs ||
-    (await getModulesDefinitions(path.join(__dirname, 'module'), special))
+  const moduleDefinitions = moduleDefs || getModulesDefinitions(special)
 
   for (const moduleDef of moduleDefinitions) {
     // Register the route.
@@ -216,33 +224,51 @@ async function consturctServer(moduleDefs) {
         req.query,
         req.body,
         req.files,
+        { anonymous_token: anonymous_token },
+        { ip: req.ip },
       )
 
       try {
-        const moduleResponse = await moduleDef.module(query, request)
+        let moduleResponse = await netease_cloud_music_api.request(
+          moduleDef.identifier,
+          query,
+        )
+
         console.log('[OK]', decode(req.originalUrl))
 
+        /**
+         * 拿到请求结果的 cookie,
+         * 如果是 https 就加上SameSite=None; Secure属性,
+         * 如果query 有noCookie参数,返回结果的 header 就不带 cookie
+         * 因为扫码登录后网易返回的 cookie 特别大,容易报错
+         */
         const cookies = moduleResponse.cookie
-        if (Array.isArray(cookies) && cookies.length > 0) {
-          if (req.protocol === 'https') {
-            // Try to fix CORS SameSite Problem
-            res.append(
-              'Set-Cookie',
-              cookies.map((cookie) => {
-                return cookie + '; SameSite=None; Secure'
-              }),
-            )
-          } else {
-            res.append('Set-Cookie', cookies)
+        if (!query.noCookie) {
+          if (Array.isArray(cookies) && cookies.length > 0) {
+            if (req.protocol === 'https') {
+              // Try to fix CORS SameSite Problem
+              res.append(
+                'Set-Cookie',
+                cookies.map((cookie) => {
+                  return cookie + '; SameSite=None; Secure'
+                }),
+              )
+            } else {
+              res.append('Set-Cookie', cookies)
+            }
           }
         }
-        res.status(moduleResponse.status).send(moduleResponse.body)
+
+        console.log('返回结果', moduleResponse)
+
+        res.status(moduleResponse.code).send(moduleResponse.data)
       } catch (/** @type {*} */ moduleResponse) {
+        console.log('错误', moduleResponse)
         console.log('[ERR]', decode(req.originalUrl), {
           status: moduleResponse.status,
-          body: moduleResponse.body,
+          body: moduleResponse.data,
         })
-        if (!moduleResponse.body) {
+        if (!moduleResponse.data) {
           res.status(404).send({
             code: 404,
             data: null,
@@ -250,10 +276,13 @@ async function consturctServer(moduleDefs) {
           })
           return
         }
-        if (moduleResponse.body.code == '301')
-          moduleResponse.body.msg = '需要登录'
-        res.append('Set-Cookie', moduleResponse.cookie)
-        res.status(moduleResponse.status).send(moduleResponse.body)
+        if (moduleResponse.data.code == '301')
+          moduleResponse.data.msg = '需要登录'
+        if (!query.noCookie) {
+          res.append('Set-Cookie', moduleResponse.data.cookie)
+        }
+
+        res.status(moduleResponse.code).send(moduleResponse.data)
       }
     })
   }

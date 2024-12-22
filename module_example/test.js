@@ -3,7 +3,7 @@ const {
   user_cloud,
   album_sublist,
   song_url,
-} = require('../server')
+} = require('../main')
 async function test() {
   try {
     const result = await login_cellphone({
@@ -23,7 +23,7 @@ async function test() {
       cookie: result.body.cookie,
       id: 33894312,
     })
-    console.log(result4.body)
+    console.log(result4)
   } catch (error) {
     console.log(error)
   }
